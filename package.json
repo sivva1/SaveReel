@@ -2,5 +2,5 @@
   "name": "reelsaver-pro",
   "version": "1.0.0",
   "description": "Free Instagram Reel, Video & Photo Downloader",
-  "engines": { "node": "18.x" }
+  "engines": { "node": "24.x" }
 }
