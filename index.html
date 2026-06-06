@@ -1556,72 +1556,76 @@ function doDownload(page) {
 }
 
 /* Fetch with API + mock fallback */
-function fetchMedia(url) {
-  return new Promise(function(resolve) {
-    // Try real API first
-    var controller = null;
-    var timeoutId  = null;
-    try {
-      controller = new AbortController();
-      timeoutId  = setTimeout(function() { controller.abort(); }, 8000);
-    } catch(e) {}
+/* ── Parse & validate Instagram URL ─────────── */
+function parseIG(url) {
+  try {
+    var u = new URL(url.trim());
+    var h = u.hostname.replace('www.','');
+    if (['instagram.com','instagr.am'].indexOf(h) === -1) return null;
+    var p = u.pathname;
+    var type = 'post';
+    if (/\/reel(s)?\//.test(p))     type = 'reel';
+    else if (/\/tv\//.test(p))      type = 'video';
+    else if (/\/stories\//.test(p)) type = 'story';
+    var m = p.match(/\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/);
+    return m ? { shortcode: m[1], type: type, url: u.href } : null;
+  } catch(e) { return null; }
+}
 
-    var fetchOpts = {
+/* ── Main download fetcher ───────────────────── */
+function fetchMedia(igUrl) {
+  return new Promise(function(resolve) {
+    var parsed = parseIG(igUrl);
+    if (!parsed) {
+      resolve({ success: false, error: 'Invalid Instagram URL. Please paste a public post or reel link.' });
+      return;
+    }
+    var sc   = parsed.shortcode;
+    var type = parsed.type;
+    var label = type.charAt(0).toUpperCase() + type.slice(1);
+
+    /* Try Vercel API first (only works when deployed) */
+    fetch('/api/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url })
-    };
-    if (controller) fetchOpts.signal = controller.signal;
-
-    fetch('/api/download', fetchOpts)
-      .then(function(r) {
-        if (timeoutId) clearTimeout(timeoutId);
-        if (!r.ok) throw new Error('API returned ' + r.status);
-        return r.json();
-      })
-      .then(function(data) { resolve(data); })
-      .catch(function() {
-        if (timeoutId) clearTimeout(timeoutId);
-        // API unavailable — use client-side mock
-        resolve(mockFetch(url));
-      });
+      body: JSON.stringify({ url: igUrl }),
+      signal: AbortSignal.timeout(8000)
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.success && data.media_url) {
+        resolve(data);
+      } else {
+        throw new Error('no direct url');
+      }
+    })
+    .catch(function() {
+      /* Vercel API not available — show downloader buttons */
+      resolve(buildDownloadButtons(igUrl, sc, type, label));
+    });
   });
 }
 
-/* Client-side mock (no API needed) */
-function mockFetch(url) {
-  try {
-    var u    = new URL(url);
-    var host = u.hostname.replace('www.', '');
-    if (['instagram.com','instagr.am'].indexOf(host) === -1) {
-      return { success: false, error: 'Only Instagram URLs are supported.' };
-    }
-    var path = u.pathname;
-    var type = 'post';
-    if (/\/reel(s)?\//.test(path))    type = 'reel';
-    else if (/\/tv\//.test(path))     type = 'video';
-    else if (/\/stories\//.test(path))type = 'story';
-    var m  = path.match(/\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/);
-    if (!m) return { success: false, error: 'Could not extract media ID. Make sure the URL is a public Instagram post or reel.' };
-    var sc = m[1];
-    var label = type.charAt(0).toUpperCase() + type.slice(1);
-    return {
-      success: true, shortcode: sc, type: type,
-      title: 'Instagram ' + label,
-      author: '', thumbnail: '',
-      embed_url: 'https://www.instagram.com/p/' + sc + '/embed/captioned/',
-      source_url: url,
-      qualities: [
-        { label:'HD 1080p', ext:'mp4', size:'~18 MB', icon:'🎬' },
-        { label:'HD 720p',  ext:'mp4', size:'~9 MB',  icon:'🎥' },
-        { label:'SD 480p',  ext:'mp4', size:'~5 MB',  icon:'📹' },
-        { label:'Audio MP3',ext:'mp3', size:'~3 MB',  icon:'🎵' }
-      ],
-      note: 'Running in demo mode (no API). Deploy to Vercel + add RAPIDAPI_KEY for real downloads. Tap the embed to watch.'
-    };
-  } catch(e) {
-    return { success: false, error: 'Invalid URL: ' + e.message };
-  }
+/* ── Build result with working download service buttons ── */
+function buildDownloadButtons(igUrl, sc, type, label) {
+  var encoded = encodeURIComponent(igUrl);
+  /* These are real, working free Instagram downloader services */
+  return {
+    success:    true,
+    shortcode:  sc,
+    type:       type,
+    title:      'Instagram ' + label,
+    author:     '',
+    thumbnail:  '',
+    media_url:  null,
+    embed_url:  'https://www.instagram.com/p/' + sc + '/embed/captioned/',
+    source_url: igUrl,
+    /* Pass the encoded URL and sc so resultHTML can build buttons */
+    dl_encoded: encoded,
+    dl_sc:      sc,
+    qualities:  [],
+    note:       'Choose a download option below.'
+  };
 }
 
 function skeletonHTML() {
@@ -1647,55 +1651,139 @@ function errorHTML(msg) {
 }
 
 function resultHTML(d) {
-  var qs = '';
+  var igUrl   = d.source_url || '';
+  var sc      = d.shortcode  || '';
+  var encoded = encodeURIComponent(igUrl);
+  var type    = d.type || 'post';
 
-  if (d.qualities && d.qualities.length > 0) {
-    d.qualities.forEach(function(q) {
-      var dlUrl = q.url ? q.url : (d.media_url ? d.media_url : d.source_url);
-      qs += '<a href="' + dlUrl + '" download target="_blank" rel="noopener" class="q-btn" onclick="showDlToast()">' +
-        '<span class="q-icon">' + q.icon + '</span>' +
-        '<span><span class="q-label">' + q.label + '</span><br>' +
-        '<span class="q-size">' + q.ext.toUpperCase() + ' &middot; ' + q.size + '</span></span>' +
-        '<span style="margin-left:auto;font-size:.75rem;color:var(--ok);font-weight:700">&#8595;</span></a>';
-    });
-  } else {
-    qs = '<div style="grid-column:1/-1;padding:14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.22);border-radius:12px;font-size:.84rem;color:var(--warn);text-align:center">' +
-      '&#9888;&#65039; Direct link unavailable. Long-press the video below to save.</div>';
-  }
+  /* ── Thumbnail ── */
+  var thumb = d.thumbnail
+    ? '<img src="' + d.thumbnail + '" class="res-thumb" alt="Thumb" onerror="this.style.display=\'none\'">'
+    : '<div class="res-thumb" style="background:linear-gradient(135deg,var(--p),var(--s));display:flex;align-items:center;justify-content:center;font-size:2rem">🎬</div>';
 
-  var thumb = '';
-  if (d.thumbnail) {
-    thumb = '<img src="' + d.thumbnail + '" class="res-thumb" alt="Thumb" onerror="this.style.display=\'none\'">';
-  }
-
-  var bigBtn = '';
-  if (d.media_url) {
-    bigBtn = '<a href="' + d.media_url + '" download target="_blank" rel="noopener" ' +
-      'class="dl-main-btn" style="text-decoration:none;margin-bottom:14px;max-width:100%;display:flex" ' +
-      'onclick="showDlToast()">' +
-      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">' +
-      '<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>' +
-      '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
-      ' Download Now</a>';
-  }
-
-  var srcUrl = d.source_url || '';
-
-  return '<div class="glass res-card" style="margin-top:20px">' +
-    '<div class="res-meta">' + thumb +
-    '<div><span class="res-badge">' + d.type + '</span>' +
+  /* ── Header ── */
+  var header = '<div class="res-meta">' + thumb +
+    '<div style="min-width:0"><span class="res-badge">' + type + '</span>' +
     '<div class="res-title">' + (d.title || 'Instagram Media') + '</div>' +
     (d.author ? '<div class="res-author">@' + d.author + '</div>' : '') +
-    '</div></div>' +
-    bigBtn +
-    '<div class="q-grid" style="margin-bottom:14px">' + qs + '</div>' +
-    '<iframe class="res-embed" src="' + d.embed_url + '" allowfullscreen loading="lazy" scrolling="no" title="Instagram embed"></iframe>' +
-    '<div class="res-note">&#8505;&#65039; ' + (d.note || 'Tap Download Now or a quality button to save.') + '</div>' +
-    '<div class="res-actions">' +
-    '<button class="btn btn-ghost btn-sm" onclick="copyLink(\'' + srcUrl + '\')">&#128203; Copy Link</button>' +
-    '<button class="btn btn-outline btn-sm" onclick="shareLink(\'' + srcUrl + '\')">&#128279; Share</button>' +
+    '</div></div>';
+
+  /* ── If Vercel API gave us a real media_url ── */
+  if (d.media_url) {
+    var qs = '';
+    if (d.qualities && d.qualities.length > 0) {
+      d.qualities.forEach(function(q) {
+        var u = q.url || d.media_url;
+        qs += '<a href="' + u + '" download target="_blank" rel="noopener" class="q-btn" onclick="showDlToast()">' +
+          '<span class="q-icon">' + q.icon + '</span>' +
+          '<span><span class="q-label">' + q.label + '</span><br>' +
+          '<span class="q-size">' + q.ext.toUpperCase() + (q.size ? ' &middot; ' + q.size : '') + '</span></span>' +
+          '<span style="margin-left:auto;color:var(--ok);font-weight:800;font-size:1.1rem">&#8595;</span></a>';
+      });
+    } else {
+      qs = '<a href="' + d.media_url + '" download target="_blank" rel="noopener" class="q-btn" onclick="showDlToast()">' +
+        '<span class="q-icon">🎬</span><span><span class="q-label">Download Video</span><br>' +
+        '<span class="q-size">MP4</span></span>' +
+        '<span style="margin-left:auto;color:var(--ok);font-weight:800;font-size:1.1rem">&#8595;</span></a>';
+    }
+    return '<div class="glass res-card" style="margin-top:20px">' + header +
+      '<a href="' + d.media_url + '" download target="_blank" rel="noopener" ' +
+      'class="dl-main-btn" style="text-decoration:none;margin-bottom:16px;max-width:100%;display:flex" onclick="showDlToast()">' +
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">' +
+      '<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+      ' Download Now</a>' +
+      '<div class="q-grid" style="margin-bottom:16px">' + qs + '</div>' +
+      '<iframe class="res-embed" src="' + d.embed_url + '" allowfullscreen loading="lazy" scrolling="no"></iframe>' +
+      '<div class="res-note">&#8505; ' + (d.note || 'Tap Download Now to save.') + '</div>' +
+      '<div class="res-actions">' +
+      '<button class="btn btn-ghost btn-sm" onclick="copyLink(\'' + igUrl.replace(/'/g,"\\'") + '\')">&#128203; Copy Link</button>' +
+      '<button class="btn btn-outline btn-sm" onclick="shareLink(\'' + igUrl.replace(/'/g,"\\'") + '\')">&#128279; Share</button>' +
+      '</div></div>';
+  }
+
+  /* ── No direct URL — show big download service buttons ── */
+  var services = [
+    {
+      name:  'SnapInsta',
+      icon:  '⚡',
+      color: '#6366F1',
+      url:   'https://snapinsta.app/?url=' + encoded,
+      desc:  'Fast & Free'
+    },
+    {
+      name:  'SaveFrom',
+      icon:  '💾',
+      color: '#10B981',
+      url:   'https://en.savefrom.net/#url=' + encoded,
+      desc:  'HD Quality'
+    },
+    {
+      name:  'SSSTik / Reels',
+      icon:  '🎬',
+      color: '#8B5CF6',
+      url:   'https://sssinstagram.com/?url=' + encoded,
+      desc:  'No Watermark'
+    },
+    {
+      name:  'iGram',
+      icon:  '📥',
+      color: '#06B6D4',
+      url:   'https://igram.world/?url=' + encoded,
+      desc:  'All Formats'
+    },
+    {
+      name:  'Inflact',
+      icon:  '🔥',
+      color: '#F59E0B',
+      url:   'https://inflact.com/downloader/instagram/?' + encoded,
+      desc:  'Free Downloads'
+    },
+    {
+      name:  'Open in Browser',
+      icon:  '📱',
+      color: '#EF4444',
+      url:   igUrl,
+      desc:  'View on Instagram'
+    }
+  ];
+
+  var btns = '';
+  services.forEach(function(s) {
+    btns += '<a href="' + s.url + '" target="_blank" rel="noopener" ' +
+      'style="display:flex;align-items:center;gap:14px;padding:15px 18px;' +
+      'background:var(--sur);border:1.5px solid var(--bdr);border-radius:14px;' +
+      'text-decoration:none;color:var(--txt);transition:all .2s;margin-bottom:10px;' +
+      'font-family:var(--font);" ' +
+      'onmouseover="this.style.borderColor=\'' + s.color + '\';this.style.background=\'rgba(99,102,241,.08)\'" ' +
+      'onmouseout="this.style.borderColor=\'var(--bdr)\';this.style.background=\'var(--sur)\'" ' +
+      'ontouchstart="this.style.borderColor=\'' + s.color + '\';this.style.background=\'rgba(99,102,241,.08)\'">' +
+      '<span style="font-size:1.6rem;flex-shrink:0">' + s.icon + '</span>' +
+      '<span style="flex:1;min-width:0">' +
+        '<span style="display:block;font-weight:700;font-size:.95rem">' + s.name + '</span>' +
+        '<span style="font-size:.8rem;color:var(--muted)">' + s.desc + '</span>' +
+      '</span>' +
+      '<span style="flex-shrink:0;background:' + s.color + ';color:#fff;padding:7px 16px;' +
+      'border-radius:9999px;font-size:.82rem;font-weight:700">Download ↗</span>' +
+      '</a>';
+  });
+
+  return '<div class="glass res-card" style="margin-top:20px">' +
+    header +
+    '<div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2);' +
+    'border-radius:12px;padding:14px 16px;margin-bottom:18px;text-align:center">' +
+    '<p style="font-weight:700;margin-bottom:4px;font-size:.95rem">&#9989; Reel Detected!</p>' +
+    '<p style="font-size:.82rem;color:var(--muted)">Tap any service below to download your ' + type + '</p>' +
+    '</div>' +
+    btns +
+    '<div style="margin:16px 0;border-top:1px solid var(--bdr)"></div>' +
+    '<p style="font-size:.8rem;color:var(--muted);margin-bottom:10px;font-weight:600">&#128065; Preview</p>' +
+    '<iframe class="res-embed" src="' + d.embed_url + '" allowfullscreen loading="lazy" scrolling="no"></iframe>' +
+    '<div class="res-actions" style="margin-top:14px">' +
+    '<button class="btn btn-ghost btn-sm" onclick="copyLink(\'' + igUrl.replace(/'/g,"\\'") + '\')">&#128203; Copy Link</button>' +
+    '<button class="btn btn-outline btn-sm" onclick="shareLink(\'' + igUrl.replace(/'/g,"\\'") + '\')">&#128279; Share</button>' +
     '</div></div>';
 }
+
 
 function showDlToast() {
   toast('Download starting...', 'success', 2000);
